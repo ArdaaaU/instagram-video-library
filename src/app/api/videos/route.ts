@@ -5,42 +5,63 @@ import fs from "fs";
 import path from "path";
 import { VideoItem } from "@/types/video";
 
-const dataFilePath = path.join(process.cwd(), "src", "data", "library.json");
+const localDataFilePath = path.join(process.cwd(), "src", "data", "library.json");
+const tmpDataFilePath = path.join("/tmp", "library.json");
 
-// Dosyadan videoları güvenle oku
+// Bellek içi önbellek (Serverless fonksiyon çalıştığı sürece güncel kalması için)
+let memoryCache: VideoItem[] | null = null;
+
 function readVideosFromDisk(): VideoItem[] {
+  if (memoryCache) return memoryCache;
+
   try {
-    if (!fs.existsSync(dataFilePath)) {
-      return [];
+    // 1. Önce /tmp dizinindeki güncellenmiş dosyaya bak
+    if (fs.existsSync(tmpDataFilePath)) {
+      const content = fs.readFileSync(tmpDataFilePath, "utf8");
+      memoryCache = JSON.parse(content) || [];
+      return memoryCache!;
     }
-    const content = fs.readFileSync(dataFilePath, "utf8");
-    return JSON.parse(content) || [];
+
+    // 2. Yoksa proje içindeki varsayılan library.json dosyasına bak
+    if (fs.existsSync(localDataFilePath)) {
+      const content = fs.readFileSync(localDataFilePath, "utf8");
+      memoryCache = JSON.parse(content) || [];
+      return memoryCache!;
+    }
+    return [];
   } catch (err) {
     console.error("Dosya okuma hatası:", err);
     return [];
   }
 }
 
-// Dosyaya videoları yaz
 function writeVideosToDisk(videos: VideoItem[]): boolean {
+  memoryCache = videos;
+
+  // 1. Önce yerel dosyaya yazmayı dene
   try {
-    fs.writeFileSync(dataFilePath, JSON.stringify(videos, null, 2), "utf8");
+    fs.writeFileSync(localDataFilePath, JSON.stringify(videos, null, 2), "utf8");
     return true;
   } catch (err) {
-    console.error("Dosya yazma hatası:", err);
-    return false;
+    // Vercel Serverless (Read-only) ortamındaysak /tmp dizinine yaz
+    try {
+      fs.writeFileSync(tmpDataFilePath, JSON.stringify(videos, null, 2), "utf8");
+      return true;
+    } catch (tmpErr) {
+      console.error("Geçici dosyaya yazma hatası:", tmpErr);
+      return false;
+    }
   }
 }
 
-// 1. GET: Tüm videoları listele (Herkese açık)
+// 1. GET: Tüm videoları listele
 export async function GET() {
   const videos = readVideosFromDisk();
   return NextResponse.json({ videos });
 }
 
-// 2. POST: Tekil video veya JSON ile toplu video ekleme (SADECE ADMİN)
+// 2. POST: Video veya JSON ekle (SADECE ADMİN)
 export async function POST(req: NextRequest) {
-  // Yetki Kontrolü
   const token = req.cookies.get("instavault_session")?.value;
   if (!token || !verifySessionToken(token)) {
     return NextResponse.json(
@@ -58,7 +79,6 @@ export async function POST(req: NextRequest) {
     }
 
     const currentVideos = readVideosFromDisk();
-    // Mevcut Instagram ID'lerini bir Set içinde topla (Hızlı ve kesin mükerrer kontrolü)
     const existingIds = new Set<string>();
     currentVideos.forEach((v) => {
       const id = extractInstagramId(v.url) || v.id;
@@ -77,13 +97,11 @@ export async function POST(req: NextRequest) {
         continue;
       }
 
-      // Kütüphanede zaten var mı? Varsa ATLA!
       if (existingIds.has(instagramId)) {
         skippedCount++;
         continue;
       }
 
-      // Aynı gelen liste içinde tekrar varsa engelle
       existingIds.add(instagramId);
 
       const title = (item.title || "İsimsiz Video").trim();
@@ -108,19 +126,18 @@ export async function POST(req: NextRequest) {
     if (addedVideos.length === 0) {
       return NextResponse.json({
         success: false,
-        message: "Eklenen tüm videolar kütüphanede zaten mevcut olduğu için hiçbiri tekrar eklenmedi.",
+        message: "Eklenen videolar kütüphanede zaten mevcut olduğu için hiçbiri tekrar eklenmedi.",
         addedCount: 0,
         skippedCount,
       });
     }
 
-    // Yeni videoları listenin en başına ekle ve diske yaz
     const updatedLibrary = [...addedVideos, ...currentVideos];
     writeVideosToDisk(updatedLibrary);
 
     return NextResponse.json({
       success: true,
-      message: `${addedVideos.length} yeni video kütüphaneye eklendi. (${skippedCount} mükerrer/geçersiz video atlandı)`,
+      message: `${addedVideos.length} yeni video kütüphaneye eklendi. (${skippedCount} mükerrer atlandı)`,
       addedCount: addedVideos.length,
       skippedCount,
       videos: updatedLibrary,
@@ -132,7 +149,6 @@ export async function POST(req: NextRequest) {
 
 // 3. DELETE: Belirtilen videoyu sil (SADECE ADMİN)
 export async function DELETE(req: NextRequest) {
-  // Yetki Kontrolü
   const token = req.cookies.get("instavault_session")?.value;
   if (!token || !verifySessionToken(token)) {
     return NextResponse.json(
@@ -162,7 +178,7 @@ export async function DELETE(req: NextRequest) {
 
     return NextResponse.json({
       success: true,
-      message: "Video başarıyla kütüphaneden silindi.",
+      message: "Video başarıyla silindi.",
       videos: updatedVideos,
     });
   } catch (err: any) {
